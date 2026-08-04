@@ -6,6 +6,11 @@ default:
 # -- Configuration ---------------------------------------------------------
 export image_name := env("BUILD_IMAGE_NAME", "base")
 export image_registry := env("BUILD_IMAGE_REGISTRY", "ghcr.io/projectbluefin")
+# The tag the local build/verify/push recipes hand between each other. It is
+# never published: keeping it distinct from any registry tag means a local
+# working image can never be mistaken for, or accidentally pushed as, a
+# released one.
+local_tag := "build"
 
 # Same bst2 container image FSDK/dakota CI uses -- pinned by SHA.
 export bst2_image := env("BST2_IMAGE", "registry.gitlab.com/freedesktop-sdk/infrastructure/freedesktop-sdk-docker-images/bst2:64eb0b4930d57a92710822898fb73af6cc1ae35d")
@@ -42,6 +47,15 @@ bst *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p "${HOME}/.cache/buildstream"
+    # Regenerated on every invocation from {{fsdk_version}} (this Justfile's
+    # own single source of truth, parsed from elements/freedesktop-sdk.bst's
+    # pinned ref) so BuildStream elements can consume the exact point
+    # release via `(@): include/fsdk-version.yml` without re-parsing it
+    # independently. Gitignored; never hand-edited. See
+    # docs/skills/vm-podman-guest.md.
+    cat > include/fsdk-version.yml <<'EOF'
+    fsdk-version: "{{fsdk_version}}"
+    EOF
     RE_FLAG=()
     PF_PID=""
     cleanup() { [ -n "$PF_PID" ] && kill "$PF_PID" 2>/dev/null || true; }
@@ -99,7 +113,12 @@ bst *ARGS:
         "{{bst2_image}}" \
         bash -c 'bst --colors "$@"' -- --no-interactive "${RE_FLAG[@]}" ${BST_FLAGS:-} {{ARGS}}
 
-# Print the tag set derived from the FSDK release: latest, minor line, point release/beta tag.
+# Print the tag set derived from the FSDK release: minor line and point
+# release/beta tag. Deliberately no "latest": a mutable rolling alias invites
+# consumers to deploy an unpinned image and silently changes what they run.
+# Every published tag here is either immutable (the point release) or moves
+# only within a declared minor line, so a consumer always states how much
+# drift they accept. Pin by digest when even that is too much.
 [group('info')]
 tags:
     #!/usr/bin/env bash
@@ -107,15 +126,33 @@ tags:
     V="{{fsdk_version}}"
     MINOR="$(echo "$V" | grep -oE '^[0-9]+\.[0-9]+')"
     if [ "$V" = "$MINOR" ]; then
-        printf '%s\n%s\n' latest "$V"
+        printf '%s\n' "$V"
     else
-        printf '%s\n%s\n%s\n' latest "$MINOR" "$V"
+        printf '%s\n%s\n' "$MINOR" "$V"
     fi
+
+# Print the OCI image names from the canonical manifest (elements/targets.json),
+# one per line. Single source of truth for the GHA build/manifest matrices,
+# `just validate`, and `just sbom`/`sboms` -- add a package here once, nowhere else.
+[group('info')]
+image-list:
+    @jq -r '.oci_images[]' elements/targets.json
+
+# Print the OCI image names as a JSON array, for GitHub Actions `fromJson()` matrices.
+[group('info')]
+image-matrix:
+    @jq -c '.oci_images' elements/targets.json
 
 # ── Validate ──────────────────────────────────────────────────────────
 [group('dev')]
 validate:
-    just bst show --deps all oci/base.bst oci/static.bst oci/skopeo.bst oci/lab-runner.bst oci/python.bst oci/buildah.bst oci/qemu-img.bst oci/ramalama.bst
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ELEMENTS=()
+    while IFS= read -r img; do
+        ELEMENTS+=("oci/${img}.bst")
+    done < <(just image-list)
+    just bst show --deps all "${ELEMENTS[@]}" podman-vm/podman-vm-efi.bst
 
 # ── Build ─────────────────────────────────────────────────────────────
 # Build one OCI image (controlled by BUILD_IMAGE_NAME) and load into podman.
@@ -133,7 +170,7 @@ build:
 export:
     #!/usr/bin/env bash
     set -euo pipefail
-    FINAL_REF="{{image_registry}}/{{image_name}}:latest"
+    FINAL_REF="{{image_registry}}/{{image_name}}:{{local_tag}}"
 
     echo "==> Exporting OCI image -> ${FINAL_REF}..."
     rm -rf .build-out
@@ -150,7 +187,6 @@ export:
         python)     DESC="Minimal, high-integrity distroless Python 3 runtime built on freedesktop-sdk" ;;
         buildah)    DESC="Distroless Buildah container-building tool built on freedesktop-sdk" ;;
         qemu-img)   DESC="Distroless qemu-img disk image utility built on freedesktop-sdk" ;;
-        ramalama)   DESC="Distroless RamaLama helper image built on freedesktop-sdk" ;;
         *)          DESC="Project Bluefin distroless container image" ;;
     esac
 
@@ -170,7 +206,7 @@ export:
       | {{sudo_cmd}} podman build --pull=never --squash-all "${LABEL_ARGS[@]}" -t "${FINAL_REF}" -f - .
     echo "==> Built ${FINAL_REF}"
 
-# Push the locally built :latest under all derived tags to a given repo ref.
+# Push the locally built image under all derived tags to a given repo ref.
 # The FSDK point-release tag (e.g. :25.08.13) is treated as immutable: if it
 # already exists at the destination it is skipped, never overwritten.
 # Usage: just tag-push ghcr.io/projectbluefin/base
@@ -178,7 +214,7 @@ export:
 tag-push REPO:
     #!/usr/bin/env bash
     set -euo pipefail
-    SRC="{{image_registry}}/{{image_name}}:latest"
+    SRC="{{image_registry}}/{{image_name}}:{{local_tag}}"
     while read -r t; do
         if [ "$t" = "{{fsdk_version}}" ] && skopeo inspect --no-tags "docker://{{REPO}}:$t" >/dev/null 2>&1; then
             echo "==> skipping {{REPO}}:$t (point-release tag already published, immutable)"
@@ -195,7 +231,7 @@ tag-push REPO:
 push-quay REPO:
     #!/usr/bin/env bash
     set -euo pipefail
-    SRC="{{image_registry}}/{{image_name}}:latest"
+    SRC="{{image_registry}}/{{image_name}}:{{local_tag}}"
     while read -r t; do
         echo "==> Tagging $SRC to {{REPO}}:$t..."
         {{sudo_cmd}} podman tag "$SRC" "{{REPO}}:$t"
@@ -211,7 +247,7 @@ push-quay REPO:
 verify:
     #!/usr/bin/env bash
     set -euo pipefail
-    REF="{{image_registry}}/{{image_name}}:latest"
+    REF="{{image_registry}}/{{image_name}}:{{local_tag}}"
     IMG="{{image_name}}"
 
     # Guard against silent size creep. These are uncompressed local Podman
@@ -222,7 +258,6 @@ verify:
         skopeo)     MAX_BYTES=$((224 * 1024 * 1024)) ;;
         python)     MAX_BYTES=$((144 * 1024 * 1024)) ;;
         qemu-img)   MAX_BYTES=$((192 * 1024 * 1024)) ;;
-        ramalama)   MAX_BYTES=$((160 * 1024 * 1024)) ;;
         buildah)    MAX_BYTES=$((256 * 1024 * 1024)) ;;
         lab-runner) MAX_BYTES=$((320 * 1024 * 1024)) ;;
         *)          echo "FAIL: no size threshold configured for $IMG" >&2; exit 1 ;;
@@ -285,23 +320,6 @@ verify:
             echo "FAIL: locale/build-tool bloat present — slim recipe regressed"; exit 1
         fi
         echo "OK: locale/build-tool bloat removed"
-
-        if [ "$IMG" = "ramalama" ]; then
-            echo "==> RamaLama-specific payload checks"
-            if ! grep -qE '^usr/bin/ramalama$' "$LISTING"; then
-                echo "FAIL: /usr/bin/ramalama missing from image"; exit 1
-            fi
-            if ! grep -qE '^usr/share/ramalama/shortnames\.conf$' "$LISTING"; then
-                echo "FAIL: /usr/share/ramalama/shortnames.conf missing from image"; exit 1
-            fi
-            if ! grep -qE '^usr/share/ramalama/ramalama\.conf$' "$LISTING"; then
-                echo "FAIL: /usr/share/ramalama/ramalama.conf missing from image"; exit 1
-            fi
-            if grep -qE '(^|/)pip(3(\.[0-9]+)?)?$|site-packages/(pip|setuptools|wheel|pkg_resources|distlib)' "$LISTING"; then
-                echo "FAIL: package-manager payload present in RamaLama image"; exit 1
-            fi
-            echo "OK: RamaLama payload present and pip/setuptools removed"
-        fi
     fi
 
     echo "==> smoke test (executing binary)"
@@ -325,11 +343,6 @@ verify:
             echo "FAIL: qemu-img failed to execute"; exit 1
         fi
         echo "OK: qemu-img executes successfully"
-    elif [ "$IMG" = "ramalama" ]; then
-        if ! {{sudo_cmd}} podman run --rm "$REF" version >/dev/null; then
-            echo "FAIL: ramalama failed to execute"; exit 1
-        fi
-        echo "OK: ramalama executes successfully"
     elif [ "$IMG" = "lab-runner" ]; then
         if ! {{sudo_cmd}} podman run --rm "$REF" -c "curl --version && git --version && jq --version && python3 --version" >/dev/null; then
             echo "FAIL: lab-runner tools failed to execute"; exit 1
@@ -338,6 +351,236 @@ verify:
     fi
 
     echo "==> verify passed (${IMG})"
+
+# -- Donate-clanker VM guest disk image --------------------------------------
+# Full-OS, shell-enabled bootable EFI/raw donate-clanker guest (see
+# docs/skills/vm-podman-guest.md). NOT an OCI image: never loaded into
+# Podman, only checked out and published as versioned GitHub Release assets.
+
+# Build the podman-vm-efi.bst element (BuildStream build only, no export).
+[group('vm')]
+build-podman-vm:
+    just bst build podman-vm/podman-vm-efi.bst
+
+# Check out ONLY the element's install-root -- the raw disk plus its .sha256
+# manifest -- into dist-vm/. Deliberately does NOT load it into Podman as an
+# OCI image (this is a bootable VM disk, not a container layer).
+[group('vm')]
+export-podman-vm: build-podman-vm
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf dist-vm
+    just bst artifact checkout podman-vm/podman-vm-efi.bst --directory dist-vm
+    echo "==> wrote:" && ls -lh dist-vm/
+
+# Convert the exported raw disk to QCOW2 alongside it (requires the
+# `qemu-img` binary from the `qemu-utils` package on the runner/host -- this
+# is a lightweight format conversion, not a BuildStream build, so it is a
+# plain Just recipe rather than its own element). Produces
+# donate-clanker-vm-<version>-<arch>.qcow2 plus its own
+# `sha256sum --binary` manifest, matching the raw disk's checksum shape.
+[group('vm')]
+export-podman-vm-qcow2: export-podman-vm
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v qemu-img >/dev/null 2>&1 || { echo "FAIL: qemu-img not found -- install the 'qemu-utils' package" >&2; exit 1; }
+    shopt -s nullglob
+    raws=(dist-vm/donate-clanker-vm-*.raw)
+    shopt -u nullglob
+    if [ "${#raws[@]}" -ne 1 ]; then
+        echo "FAIL: expected exactly one raw VM disk in dist-vm/ (run 'just export-podman-vm' first), found ${#raws[@]}" >&2
+        exit 1
+    fi
+    raw="$(basename "${raws[0]}")"
+    qcow2="${raw%.raw}.qcow2"
+    echo "==> converting ${raw} -> ${qcow2}..."
+    qemu-img convert -f raw -O qcow2 "dist-vm/${raw}" "dist-vm/${qcow2}"
+    ( cd dist-vm && sha256sum --binary "${qcow2}" > "${qcow2}.sha256" )
+    echo "==> wrote:" && ls -lh "dist-vm/${qcow2}" "dist-vm/${qcow2}.sha256"
+
+# Compress the exported disk images with zstd for release publication.
+# GitHub Release assets are hard-capped at 2 GiB each and the raw disk is
+# larger than that (an observed aarch64 build produced a 2.3G raw), so the
+# uncompressed disk can never be an asset: an upload attempt is rejected with
+# `HTTP 422 ... size must be less than 2147483648` AFTER the small checksum
+# sidecar in the same `gh release upload` invocation has already landed. Both
+# originals are kept (--keep) so the boot test, checksum verification, and the
+# artifact attestations still operate on the real disks.
+#
+# The published contract per architecture is therefore:
+#   donate-clanker-vm-<version>-<arch>.raw.zst         (the download)
+#   donate-clanker-vm-<version>-<arch>.raw.zst.sha256  (verifies the download)
+#   donate-clanker-vm-<version>-<arch>.raw.sha256      (verifies the disk after
+#                                                       decompression)
+# and the same three names for .qcow2 when a QCOW2 was exported. This is the
+# shape donate-clanker already fetches -- see docs/skills/vm-podman-guest.md.
+[group('vm')]
+compress-podman-vm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v zstd >/dev/null 2>&1 || { echo "FAIL: zstd not found -- install the 'zstd' package" >&2; exit 1; }
+    shopt -s nullglob
+    disks=(dist-vm/donate-clanker-vm-*.raw dist-vm/donate-clanker-vm-*.qcow2)
+    shopt -u nullglob
+    if [ "${#disks[@]}" -eq 0 ]; then
+        echo "FAIL: no VM disk images in dist-vm/ (run 'just export-podman-vm' first)" >&2
+        exit 1
+    fi
+    for disk in "${disks[@]}"; do
+        echo "==> compressing $(basename "$disk") with zstd..."
+        zstd --quiet --force --keep -T0 -12 "$disk" -o "${disk}.zst"
+        ( cd dist-vm && sha256sum --binary "$(basename "${disk}.zst")" > "$(basename "${disk}.zst").sha256" )
+    done
+    echo "==> wrote:" && ls -lh dist-vm/
+
+# Publish this architecture's VM guest assets to the current FSDK
+# point-release tag (vX.Y.Z) as an all-or-nothing transaction.
+#
+# Publication is per architecture by design (see docs/skills/ci-tooling.md,
+# "Independent architecture asset publication"), so the unit of atomicity is
+# one architecture's complete asset set: the compressed disks, their download
+# checksums, the decompressed-disk checksums, and the SBOM. The rules:
+#
+#   * Preflight. Every file must exist and be under GitHub's 2 GiB per-asset
+#     limit before anything is uploaded. An oversized asset fails here, loudly,
+#     instead of half-way through the upload loop.
+#   * Rollback. Every asset uploaded by this invocation is recorded; any
+#     failure deletes them again before exiting non-zero, so a run can never
+#     leave a checksum on the release without its disk.
+#   * Repair. A release carrying only PART of this architecture's set is the
+#     debris of an earlier failed publish, not a published artifact: the
+#     orphans are deleted and the full set re-uploaded. A COMPLETE set is
+#     immutable and is never overwritten.
+#   * Post-verify. After uploading, the release is re-read and every expected
+#     name must be present with the expected byte size, or the run rolls back
+#     and fails.
+#
+# Operates on whatever is already in dist-vm/ (from `just export-podman-vm`,
+# `just export-podman-vm-qcow2`, and `just compress-podman-vm`) rather than
+# forcing a rebuild. Never publishes a mutable "latest" URL for launcher
+# consumption -- see docs/skills/vm-podman-guest.md. Requires `gh`
+# authenticated with `contents: write` on THIS repo (the workflow's default
+# GITHUB_TOKEN is sufficient -- this is a same-repo release upload, not a
+# cross-repo write, so the org's PAT ban / Mergeraptor requirement does not
+# apply; see docs/skills/ci-tooling.md).
+[group('vm')]
+publish-podman-vm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    TAG="v{{fsdk_version}}"
+    # GitHub rejects any release asset of 2 GiB or more (HTTP 422).
+    LIMIT=2147483648
+    shopt -s nullglob
+    raws=(dist-vm/donate-clanker-vm-*.raw)
+    qcow2s=(dist-vm/donate-clanker-vm-*.qcow2)
+    shopt -u nullglob
+    if [ "${#raws[@]}" -ne 1 ]; then
+        echo "FAIL: expected exactly one raw VM disk in dist-vm/ (run 'just export-podman-vm' first), found ${#raws[@]}" >&2
+        exit 1
+    fi
+    if [ "${#qcow2s[@]}" -gt 1 ]; then
+        echo "FAIL: expected at most one QCOW2 VM disk in dist-vm/, found ${#qcow2s[@]}" >&2
+        exit 1
+    fi
+
+    # The architecture this leg publishes, derived from the disk name
+    # (donate-clanker-vm-<version>-<arch>.raw) so the SBOM asset and the
+    # rollback set can never straddle two architectures.
+    raw_base="$(basename "${raws[0]}")"
+    arch="${raw_base%.raw}"; arch="${arch##*-}"
+    if [ -z "$arch" ]; then
+        echo "FAIL: could not derive architecture from ${raw_base}" >&2
+        exit 1
+    fi
+
+    # This architecture's complete asset set. The uncompressed disks are NOT
+    # assets: they exceed GitHub's per-asset limit (see compress-podman-vm).
+    assets=("${raws[0]}.zst" "${raws[0]}.zst.sha256" "${raws[0]}.sha256")
+    if [ "${#qcow2s[@]}" -eq 1 ]; then
+        assets+=("${qcow2s[0]}.zst" "${qcow2s[0]}.zst.sha256" "${qcow2s[0]}.sha256")
+    fi
+    assets+=("dist-vm/podman-vm-${arch}.spdx.json")
+
+    for f in "${assets[@]}"; do
+        if [ ! -f "$f" ]; then
+            echo "FAIL: $f not found -- run 'just export-podman-vm-qcow2', 'just sbom podman-vm' and 'just compress-podman-vm' first" >&2
+            exit 1
+        fi
+        size="$(stat -c %s "$f")"
+        if [ "$size" -ge "$LIMIT" ]; then
+            echo "FAIL: $f is ${size} bytes; GitHub rejects release assets of ${LIMIT} bytes or more. Increase compression in 'just compress-podman-vm' or shrink the disk." >&2
+            exit 1
+        fi
+    done
+
+    if ! gh release view "$TAG" >/dev/null 2>&1; then
+        echo "==> creating release $TAG (none exists yet)"
+        gh release create "$TAG" --title "Release ${TAG}" \
+            --notes "Freedesktop-SDK {{fsdk_version}} container image release."
+    fi
+
+    EXISTING="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+    present=()
+    missing=()
+    for f in "${assets[@]}"; do
+        name="$(basename "$f")"
+        if printf '%s\n' "$EXISTING" | grep -qxF "$name"; then
+            present+=("$name")
+        else
+            missing+=("$name")
+        fi
+    done
+
+    if [ "${#missing[@]}" -eq 0 ]; then
+        echo "==> skipping ${arch} (complete point-release asset set already published, immutable)"
+        exit 0
+    fi
+
+    if [ "${#present[@]}" -gt 0 ]; then
+        echo "==> WARNING: release ${TAG} carries a PARTIAL ${arch} asset set from a failed publish:" >&2
+        printf '    %s\n' "${present[@]}" >&2
+        echo "==> deleting the orphans and republishing the complete ${arch} set" >&2
+        for name in "${present[@]}"; do
+            gh release delete-asset "$TAG" "$name" --yes
+        done
+    fi
+
+    # Rollback: anything this invocation uploaded is removed again if any later
+    # step fails, so a partial ${arch} set can never survive a failed run.
+    uploaded=()
+    rollback() {
+        status=$?
+        if [ "${#uploaded[@]}" -gt 0 ]; then
+            echo "==> FAIL: publication of the ${arch} asset set failed; rolling back ${#uploaded[@]} uploaded asset(s)" >&2
+            for name in "${uploaded[@]}"; do
+                gh release delete-asset "$TAG" "$name" --yes || \
+                    echo "==> WARNING: could not delete ${name}; release ${TAG} may need manual cleanup" >&2
+            done
+        fi
+        exit "$status"
+    }
+    trap rollback ERR
+
+    for f in "${assets[@]}"; do
+        name="$(basename "$f")"
+        gh release upload "$TAG" "$f"
+        uploaded+=("$name")
+        echo "==> uploaded ${name} to release ${TAG}"
+    done
+
+    # Post-verify: every asset must be on the release at its full size.
+    PUBLISHED="$(gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"')"
+    for f in "${assets[@]}"; do
+        name="$(basename "$f")"
+        want="$(stat -c %s "$f")"
+        got="$(printf '%s\n' "$PUBLISHED" | awk -v n="$name" '$1 == n { print $2 }')"
+        if [ "$got" != "$want" ]; then
+            echo "FAIL: ${name} is ${got:-absent} on release ${TAG}, expected ${want} bytes" >&2
+            false
+        fi
+    done
+    trap - ERR
+    echo "==> published the complete ${arch} asset set to release ${TAG}"
 
 # -- Homebrew nspawn machine image -------------------------------------------
 # NOT distroless: a full dev-environment rootfs tarball for systemd-nspawn /
@@ -461,25 +704,29 @@ uninstall-brew:
     sudo rm -f /etc/systemd/nspawn/homebrew.nspawn
     echo "==> Done. Note: /home/linuxbrew is left intact. Remove it manually if desired."
 
-# Generate a BST-native SBOM (SPDX 2.3) using buildstream-sbom.
+# Generate a BST-native SBOM (SPDX 2.3) using buildstream-sbom. `variant` is
+# any name from the elements/targets.json manifest, or the special value
+# "podman-vm" for the VM guest disk (not part of the OCI manifest).
 [group('test')]
 sbom variant="base":
     #!/usr/bin/env bash
     set -euo pipefail
-    case "{{variant}}" in
-        base)       ELEMENT="oci/base.bst";        SPDX_NAME="base" ;;
-        static)     ELEMENT="oci/static.bst";      SPDX_NAME="static" ;;
-        skopeo)     ELEMENT="oci/skopeo.bst";      SPDX_NAME="skopeo" ;;
-        lab-runner) ELEMENT="oci/lab-runner.bst";  SPDX_NAME="lab-runner" ;;
-        python)     ELEMENT="oci/python.bst";      SPDX_NAME="python" ;;
-        buildah)    ELEMENT="oci/buildah.bst";     SPDX_NAME="buildah" ;;
-        qemu-img)   ELEMENT="oci/qemu-img.bst";    SPDX_NAME="qemu-img" ;;
-        ramalama)   ELEMENT="oci/ramalama.bst";    SPDX_NAME="ramalama" ;;
-        *) echo "ERROR: unknown variant '{{variant}}'" >&2; exit 1 ;;
-    esac
+    if [ "{{variant}}" = "podman-vm" ]; then
+        ELEMENT="podman-vm/podman-vm-efi.bst"
+        SPDX_NAME="podman-vm"
+    elif jq -e --arg v "{{variant}}" '.oci_images | index($v) != null' elements/targets.json >/dev/null; then
+        ELEMENT="oci/{{variant}}.bst"
+        SPDX_NAME="{{variant}}"
+    else
+        echo "ERROR: unknown variant '{{variant}}' (not in elements/targets.json, not 'podman-vm')" >&2
+        exit 1
+    fi
     OUTFILE="${SPDX_NAME}.spdx.json"
     mkdir -p "${HOME}/.cache/buildstream"
     mkdir -p "${HOME}/.cache/pip"
+    # buildstream-sbom invokes BuildStream directly rather than through `just
+    # bst`, so regenerate the same gitignored version include first.
+    printf 'fsdk-version: "%s"\n' "{{fsdk_version}}" > include/fsdk-version.yml
     GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
     {{sudo_cmd}} podman run --rm \
@@ -519,7 +766,13 @@ sboms:
     set -euo pipefail
     mkdir -p "${HOME}/.cache/buildstream"
     mkdir -p "${HOME}/.cache/pip"
+    # Keep direct buildstream-sbom invocation consistent with `just bst`.
+    printf 'fsdk-version: "%s"\n' "{{fsdk_version}}" > include/fsdk-version.yml
     GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    # Read the manifest on the host (jq is a GHA-runner/host dependency, not a
+    # bst2-container one) so the container loop below never needs its own
+    # copy of the image list.
+    IMAGES="$(jq -r '.oci_images | join(" ")' elements/targets.json)"
 
     {{sudo_cmd}} podman run --rm \
         --privileged \
@@ -530,6 +783,7 @@ sboms:
         -v "${HOME}/.cache/pip:/root/.cache/pip:rw" \
         -w /src \
         -e GIT_SHA="${GIT_SHA}" \
+        -e IMAGES="${IMAGES}" \
         "{{bst2_image}}" \
         bash -c '
             for attempt in 1 2 3; do
@@ -539,17 +793,8 @@ sboms:
                 echo "buildstream-sbom install failed (attempt ${attempt}/3); retrying in 5s..."
                 [ "${attempt}" -lt 3 ] && sleep 5
             done
-            for img in base static skopeo lab-runner python buildah qemu-img ramalama; do
-                case "$img" in
-                    base)       ELEMENT="oci/base.bst" ;;
-                    static)     ELEMENT="oci/static.bst" ;;
-                    skopeo)     ELEMENT="oci/skopeo.bst" ;;
-                    lab-runner) ELEMENT="oci/lab-runner.bst" ;;
-                    python)     ELEMENT="oci/python.bst" ;;
-                    buildah)    ELEMENT="oci/buildah.bst" ;;
-                    qemu-img)   ELEMENT="oci/qemu-img.bst" ;;
-                    ramalama)   ELEMENT="oci/ramalama.bst" ;;
-                esac
+            for img in ${IMAGES}; do
+                ELEMENT="oci/${img}.bst"
                 echo "==> Generating SBOM for ${img}..."
                 buildstream-sbom "${ELEMENT}" \
                     --spdx-name "${img}" \
