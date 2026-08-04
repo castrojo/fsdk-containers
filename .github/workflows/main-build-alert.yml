@@ -1,0 +1,59 @@
+name: Main build failure alert
+
+on:
+  workflow_run:
+    workflows: [Build images]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: main-build-failure-alert
+  cancel-in-progress: false
+
+permissions:
+  issues: write
+
+jobs:
+  report-failure:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Open or update the main build failure issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.event.workflow_run.html_url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+          RUN_ID: ${{ github.event.workflow_run.id || github.run_id }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          TITLE: "CI: nothing notices when main goes red"
+        run: |
+          set -euo pipefail
+
+          issue_json=$(gh api --paginate --slurp \
+            "repos/${REPO}/issues?state=all&per_page=100" \
+            | jq --arg title "${TITLE}" \
+              'add | map(select(.pull_request == null and .title == $title)) | .[0] // empty')
+
+          if [[ -z "${issue_json}" ]]; then
+            issue_url=$(gh issue create \
+              --repo "${REPO}" \
+              --title "${TITLE}" \
+              --body "## Main build failure\n\nThe **Build images** workflow failed on \`main\`.\n\n- Branch: \`${HEAD_BRANCH}\`\n- Commit: \`${HEAD_SHA}\`\n- Run: [${RUN_ID}](${RUN_URL})\n\nThis issue is maintained automatically; subsequent failures are added as comments.")
+            issue_number="${issue_url##*/}"
+            echo "Opened ${issue_url}"
+          else
+            issue_number=$(jq -r '.number' <<<"${issue_json}")
+            issue_state=$(jq -r '.state' <<<"${issue_json}")
+            if [[ "${issue_state}" == "closed" ]]; then
+              gh issue reopen "${issue_number}" --repo "${REPO}"
+            fi
+            echo "Updating issue #${issue_number}"
+          fi
+
+          gh issue comment "${issue_number}" \
+            --repo "${REPO}" \
+            --body "🚨 **Build images failed on \`main\`.**\n\n- Commit: \`${HEAD_SHA}\`\n- Run: [${RUN_ID}](${RUN_URL})"

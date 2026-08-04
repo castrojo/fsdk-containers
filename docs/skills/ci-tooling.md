@@ -296,3 +296,13 @@ The rules that follow, implemented in `just publish-podman-vm`:
 
 Never paper over any of this with `continue-on-error`: a half-published
 release looks like success to consumers and is worse than a clean failure.
+
+### Main build failure alerting
+
+The `main-build-alert.yml` workflow listens for the completed `Build images`
+workflow on `main`. It runs only when that workflow concludes with `failure`,
+and uses one stable issue title (`CI: nothing notices when main goes red`) to find
+the existing issue across both open and closed issues. A closed matching issue is
+reopened before the new run is added as a comment, preventing one issue per
+failure while preserving the full run history. Keep the alert workflow's
+`actions: read` and `issues: write` permissions scoped to its own job.
