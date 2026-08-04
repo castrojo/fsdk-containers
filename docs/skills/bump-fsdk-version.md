@@ -17,15 +17,19 @@ release. Tags are derived from the pinned junction ref in
 `elements/freedesktop-sdk.bst` (the `ref:` line, e.g.
 `freedesktop-sdk-25.08.13-...`):
 
-- `:latest` — rolling, every publish
-- `:25.08` or `:26.08` — FSDK minor line (moves within the line)
+- `:25.08` or `:26.08` — FSDK minor line (moves within the line; the most
+  rolling tag published — there is deliberately no `:latest`)
 - `:25.08.14` — FSDK point release, treated **immutable**
 - `:26.08beta.1` / `:26.08rc.1` — pre-release/beta/RC release tag (published whenever tracking upstream dev/beta branches)
 
 `just tags` parses these from the ref. Provenance labels
 `io.projectbluefin.fsdk.version` / `io.projectbluefin.fsdk.ref` are applied at
-export so every image self-declares its base. We aim to track every upstream development
-and beta branch, ensuring images are continuously built and published for early testing.
+export so every image self-declares its base. The
+`org.opencontainers.image.ref.name` index annotation in `elements/oci/*.bst`
+substitutes `%{fsdk-version}` (from the gitignored `include/fsdk-version.yml`
+that `just bst` regenerates), so a bump needs no edit there. We aim to track
+every upstream development and beta branch, ensuring images are continuously
+built and published for early testing.
 
 ## Procedure
 
@@ -49,22 +53,23 @@ and beta branch, ensuring images are continuously built and published for early 
    ```
 
 5. Follow the FSDK **lifecycle**: track the active minor line; when FSDK EOLs a
-   line, move `:latest` to the next supported minor. Don't pin to an EOL line.
+   line, move consumers to the next supported minor. Don't pin to an EOL line.
 
 ## Verification
 
 Before merging a bump:
 
 - [ ] `just validate` passes (element graph resolves with new ref)
-- [ ] `just tags` output matches the expected `latest / YY.MM / YY.MM.PP` triple
+- [ ] `just tags` output matches the expected `YY.MM / YY.MM.PP` pair and
+      contains no `latest`
 - [ ] Both CAS-config patches (`0001`, `0002`) applied cleanly (no patch failure in `just validate`)
 - [ ] `just build && just verify` — all 4 gates pass
 - [ ] `io.projectbluefin.fsdk.version` label on the built image matches the new FSDK version
 
 - Bumping across a minor line (e.g. 25.08 → 26.08) may rename/relocate components or restructure runtime stacks:
-  - **FSDK 26.08 Stack Refactoring:** In Freedesktop-SDK 26.08 (`26.08beta.1`+), `public-stacks/runtime-minimal.bst` no longer includes `bash` or `coreutils`. Those GNU tools moved to `public-stacks/runtime-gnu.bst`.
+  - **FSDK 26.08 Stack Refactoring:** Re-check the VM and shell stack inputs in the staged junction when moving to Freedesktop-SDK 26.08 (`26.08beta.1`+).
   - Distroless images (`base-stack.bst`) using `runtime-minimal` become even leaner by default upstream (no need to rely solely on manual `rm -f /usr/bin/bash` in `include/slim.yml`).
-  - Shell-enabled stacks (`lab-runner-stack.bst`, `brew-deps.bst`) must explicitly depend on `freedesktop-sdk.bst:public-stacks/runtime-gnu.bst` when updating to FSDK 26.08+.
+  - Shell-enabled stacks (`lab-runner-stack.bst`, `brew-deps.bst`) must explicitly depend on the staged FSDK shell stack when updating to FSDK 26.08+.
   - Re-confirm `components/*` and `public-stacks/*` names against the staged junction before assuming a dep still exists.
 - A point-release tag is immutable: once `:25.08.13` is published, never republish
   different bits under it.
@@ -79,10 +84,9 @@ Before merging a bump:
   reference those components. If you copy a junction from dakota in the future,
   strip every override whose component is not in your local dep graph.
 
-## Automated Point-Release Bumps
+## Automated FSDK Release Tracking
 
-Point releases are fully automated via the `.github/workflows/auto-update-fsdk.yml` GHA workflow.
+FSDK releases (point releases and beta/pre-releases) are tracked automatically via the `.github/workflows/auto-update-fsdk.yml` GHA workflow.
 - **Trigger:** Daily cron schedule at `03:00 UTC` and manual `workflow_dispatch`.
-- **Mechanism:** Runs `just bst source track freedesktop-sdk.bst` to check for newer refs on the tracking line. If changed, validates the element graph and commits/pushes the new junction ref directly to `main`.
-- **Build Loop:** The push trigger on `main` kicks off the standard multi-arch build and publish workflow, which rebuilds, verifies, and publishes the new point-release tag and manifests.
-
+- **Mechanism:** Runs `just bst source track freedesktop-sdk.bst` to check for newer refs on the tracking line. If the junction ref changes, the workflow validates the element graph, opens an automated PR on a version-specific branch (`auto/update-fsdk-<version>`), and dispatches a verification build via `repository_dispatch`.
+- **Build Loop:** The dispatched build workflow checks out the PR branch, rebuilds, verifies, and publishes the new release tags and manifests. Rolling and minor-line manifests are only assembled when both `x86_64` and `aarch64` builds succeed, preventing a single failed architecture from overwriting multi-arch tags.
